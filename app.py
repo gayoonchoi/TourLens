@@ -7,15 +7,23 @@ import json
 import re
 import math
 from urllib.parse import quote
+import os
+from dotenv import load_dotenv
+import csv
+import io
+import tempfile
 
 # 1. 기본 설정
+load_dotenv()
+
 class CustomAdapter(requests.adapters.HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
         context = urllib3.util.ssl_.create_urllib3_context(ciphers='DEFAULT@SECLEVEL=1')
         kwargs['ssl_context'] = context
         return super(CustomAdapter, self).init_poolmanager(*args, **kwargs)
 
-API_KEY = quote("688527d89f56c87435172d14b0d585cdd16f025055e5d472c3b091415df5c568")
+TOUR_API_KEY = os.getenv("TOUR_API_KTY")
+API_KEY = quote(TOUR_API_KEY) if TOUR_API_KEY else ""
 BASE_URL = "https://apis.data.go.kr/B551011/KorService2/"
 session = requests.Session()
 session.mount("https://", CustomAdapter())
@@ -50,6 +58,13 @@ async () => {
     } catch (error) { return ["오류", "위치를 가져올 수 없습니다."]; }
 }
 """
+
+def clean_html(raw_html):
+    if not raw_html:
+        return ""
+    cleanr = re.compile('<.*?>')
+    cleantext = re.sub(cleanr, '', raw_html)
+    return cleantext.strip()
 
 # --- API 호출 및 데이터 처리 함수들 ---
 def find_nearby_places(latitude, longitude):
@@ -136,28 +151,185 @@ def update_page_view(area_name, sigungu_name, category_name, page_to_go):
 
 # --- 상세 정보 가공 및 호출 함수들 (생략) ---
 def get_details(selected_title, places_info):
-    # ... (이전과 동일)
-    if not selected_title or not places_info: return ("",) * 6
+    if not selected_title or not places_info:
+        return ("",) * 6
+    
+    if selected_title not in places_info:
+        return ("선택된 항목을 찾을 수 없습니다.",) * 6
+
     content_id, content_type_id = places_info[selected_title]
     results = [""] * 6
     apis_to_call = [("detailCommon2", {"contentId": content_id}), ("detailIntro2", {"contentId": content_id, "contentTypeId": content_type_id}), ("detailInfo2", {"contentId": content_id, "contentTypeId": content_type_id})]
+    
     for i, (api_name, specific_params) in enumerate(apis_to_call):
         try:
             params = {**common_params, **specific_params}
             response = session.get(f"{BASE_URL}{api_name}", params=params)
-            response.raise_for_status()
-            if not response.text: raise ValueError("API 응답이 비어 있습니다.")
+            response.raise_for_status()  # 4xx, 5xx 에러 발생 시 예외 처리
+            
+            if not response.text or not response.text.strip():
+                raise ValueError("API 응답이 비어 있습니다.")
+
             response_json = response.json()
+            
             header = response_json.get('response', {}).get('header', {})
-            if header.get('resultCode') != '0000': pretty_output = f"API 오류: {header.get('resultMsg', '')}"
-            else: pretty_output = f"... (formatter logic placeholder) ..."
+            if header.get('resultCode') != '0000':
+                pretty_output = f"API 오류: {header.get('resultMsg', '')}"
+            else:
+                pretty_output = json.dumps(response_json, indent=2, ensure_ascii=False)
+
             results[i * 2] = json.dumps(response_json, indent=2, ensure_ascii=False)
             results[i * 2 + 1] = pretty_output
+
+        except json.JSONDecodeError as json_e:
+            error_msg = f"{api_name} 처리 중 JSON 오류: {json_e}\nAPI 응답 내용:\n{response.text[:500]}"
+            results[i * 2] = error_msg
+            results[i * 2 + 1] = "정보를 가져오는 데 실패했습니다."
         except Exception as e:
             error_msg = f"{api_name} 처리 중 오류: {e}"
             results[i * 2] = error_msg
             results[i * 2 + 1] = "정보를 가져오는 데 실패했습니다."
+            
     return tuple(results)
+
+def export_to_csv(area_name, sigungu_name, category_name, progress=gr.Progress()):
+    """검색된 모든 결과를 API 응답 순서에 따른 동적 컬럼 CSV 파일로 저장합니다."""
+    if not area_name:
+        gr.Warning("지역을 먼저 선택해주세요.")
+        return None
+
+    progress(0, desc="전체 데이터 개수 확인 중...")
+
+    try:
+        # 1. 전체 아이템 개수 확인
+        area_code = AREA_CODES.get(area_name)
+        content_type_id = CONTENT_TYPE_CODES.get(category_name)
+        
+        base_list_params = {**common_params, "areaCode": area_code, "numOfRows": 1, "pageNo": 1}
+        if sigungu_name and sigungu_name != "전체":
+            sigungu_response = session.get(f"{BASE_URL}areaCode2", params={**common_params, "areaCode": area_code, "numOfRows": "100"})
+            sigungu_data = sigungu_response.json()
+            sigungu_items = sigungu_data.get('response', {}).get('body', {}).get('items', {}).get('item', [])
+            sigungu_code = next((item['code'] for item in sigungu_items if item['name'] == sigungu_name), None)
+            if sigungu_code: base_list_params["sigunguCode"] = sigungu_code
+        if content_type_id:
+            base_list_params["contentTypeId"] = content_type_id
+
+        response = session.get(f"{BASE_URL}areaBasedList2", params=base_list_params)
+        response.raise_for_status()
+        total_count = response.json().get('response', {}).get('body', {}).get('totalCount', 0)
+
+        if total_count == 0:
+            gr.Info("내보낼 데이터가 없습니다.")
+            return None
+
+        # 2. 모든 기본 아이템 정보 수집
+        all_basic_items = []
+        num_of_rows = 100
+        total_pages = math.ceil(total_count / num_of_rows)
+        
+        for page_no in progress.tqdm(range(1, total_pages + 1), desc="관광지 목록 수집 중"):
+            base_list_params.update({"numOfRows": num_of_rows, "pageNo": page_no})
+            response = session.get(f"{BASE_URL}areaBasedList2", params=base_list_params)
+            response.raise_for_status()
+            items = response.json().get('response', {}).get('body', {}).get('items', {}).get('item', [])
+            if isinstance(items, dict): items = [items]
+            all_basic_items.extend(items)
+
+        # 3. 각 아이템의 상세 정보 조회 및 헤더 순서 결정
+        all_item_details = []
+        ordered_headers = []
+        seen_keys = set()
+        excluded_suffixes = ('id', 'code', 'cd')
+
+        def add_key_to_header(key):
+            is_excluded = False
+            for suffix in excluded_suffixes:
+                if key.lower().endswith(suffix):
+                    is_excluded = True
+                    break
+            if not is_excluded and key not in seen_keys:
+                ordered_headers.append(key)
+                seen_keys.add(key)
+
+        for item in progress.tqdm(all_basic_items, desc="상세 정보 조회 및 컬럼 순서 지정 중"):
+            content_id = item.get('contentid')
+            content_type_id = item.get('contenttypeid')
+            if not content_id: continue
+
+            current_item_data = {}
+            try:
+                # 기본 정보 먼저 추가
+                current_item_data.update(item)
+                for key in item.keys():
+                    add_key_to_header(key)
+
+                # 상세 정보 API들 순차적 호출
+                apis_to_process = [
+                    ("detailCommon2", {**common_params, "contentId": content_id, "defaultYN": "Y", "firstImageYN": "Y", "areacodeYN": "Y", "catcodeYN": "Y", "addrinfoYN": "Y", "mapinfoYN": "Y", "overviewYN": "Y"}),
+                    ("detailIntro2", {**common_params, "contentId": content_id, "contentTypeId": content_type_id}),
+                    ("detailInfo2", {**common_params, "contentId": content_id, "contentTypeId": content_type_id})
+                ]
+
+                for api_name, params in apis_to_process:
+                    response = session.get(f"{BASE_URL}{api_name}", params=params)
+                    response.raise_for_status()
+                    if not response.text or not response.text.strip(): continue
+                    
+                    res = response.json()
+                    res_items = res.get('response', {}).get('body', {}).get('items', {}).get('item', [])
+                    if not res_items: continue
+                    if isinstance(res_items, dict): res_items = [res_items]
+
+                    for res_item in res_items:
+                        if api_name == 'detailInfo2':
+                            infoname = res_item.get('infoname')
+                            infotext = res_item.get('infotext')
+                            if infoname and infotext:
+                                add_key_to_header(infoname)
+                                current_item_data[infoname] = infotext
+                        else:
+                            current_item_data.update(res_item)
+                            for key in res_item.keys():
+                                add_key_to_header(key)
+                
+                all_item_details.append(current_item_data)
+
+            except Exception as detail_e:
+                print(f"Error fetching details for content_id {content_id}: {detail_e}")
+                continue
+        
+        if not all_item_details:
+            gr.Info("상세 정보를 가져올 수 있는 데이터가 없습니다.")
+            return None
+
+        # 4. CSV 파일 생성
+        progress(0.9, desc="CSV 파일 생성 중...")
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=ordered_headers, extrasaction='ignore')
+        writer.writeheader()
+
+        for item_data in all_item_details:
+            cleaned_item = {k: clean_html(v) if isinstance(v, str) else v for k, v in item_data.items()}
+            writer.writerow(cleaned_item)
+        
+        csv_content = output.getvalue()
+        output.close()
+        
+        encoded_content = csv_content.encode('utf-8-sig')
+
+        with tempfile.NamedTemporaryFile(delete=False, mode='wb', suffix='.csv', prefix='tour_data_') as temp_f:
+            temp_f.write(encoded_content)
+            gr.Info("CSV 파일 생성이 완료되었습니다. 아래 링크를 클릭하여 다운로드하세요.")
+            return temp_f.name
+
+    except Exception as e:
+        import traceback
+        print(f"[export_to_csv error] {e}")
+        traceback.print_exc()
+        gr.Error(f"CSV 생성 중 오류가 발생했습니다: {e}")
+        return None
+
 
 # --- Gradio 인터페이스 구성 ---
 with gr.Blocks(title="TourAPI 관광 정보 앱") as demo:
@@ -193,8 +365,11 @@ with gr.Blocks(title="TourAPI 관광 정보 앱") as demo:
                 area_dropdown = gr.Dropdown(label="지역", choices=list(AREA_CODES.keys()))
                 sigungu_dropdown = gr.Dropdown(label="시군구", interactive=False)
                 category_dropdown = gr.Dropdown(label="카테고리", choices=list(CONTENT_TYPE_CODES.keys()), value="전체")
-            search_by_area_btn = gr.Button("검색하기", variant="primary")
             
+            with gr.Row():
+                search_by_area_btn = gr.Button("검색하기", variant="primary")
+                export_csv_btn = gr.Button("CSV로 내보내기")
+
             radio_list_area = gr.Radio(label="관광지 목록", interactive=True)
             
             with gr.Row(visible=False) as pagination_row:
@@ -203,6 +378,8 @@ with gr.Blocks(title="TourAPI 관광 정보 앱") as demo:
                 page_numbers_radio = gr.Radio(label="페이지", interactive=True, scale=3)
                 next_page_btn = gr.Button("다음 >")
                 last_page_btn = gr.Button("맨 끝 >>")
+            
+            csv_file_output = gr.File(label="다운로드", interactive=False)
 
             with gr.Accordion("상세 정보 보기", open=False):
                 common_raw_a, common_pretty_a = gr.Textbox(label="Raw JSON"), gr.Textbox(label="Formatted")
@@ -215,6 +392,8 @@ with gr.Blocks(title="TourAPI 관광 정보 앱") as demo:
             area_dropdown.change(fn=update_sigungu_dropdown, inputs=area_dropdown, outputs=sigungu_dropdown)
             search_by_area_btn.click(fn=update_page_view, inputs=[area_dropdown, sigungu_dropdown, category_dropdown, gr.Number(value=1, visible=False)], outputs=outputs_for_page_change)
             
+            export_csv_btn.click(fn=export_to_csv, inputs=[area_dropdown, sigungu_dropdown, category_dropdown], outputs=csv_file_output)
+
             # 페이지네이션 버튼 이벤트
             page_inputs = [current_area, current_sigungu, current_category]
             first_page_btn.click(lambda area, sigungu, cat: update_page_view(area, sigungu, cat, 1), inputs=page_inputs, outputs=outputs_for_page_change)
@@ -226,4 +405,18 @@ with gr.Blocks(title="TourAPI 관광 정보 앱") as demo:
             radio_list_area.change(fn=get_details, inputs=[radio_list_area, places_info_state_area], outputs=[common_raw_a, common_pretty_a, intro_raw_a, intro_pretty_a, info_raw_a, info_pretty_a])
 
 if __name__ == "__main__":
+    # 필수 라이브러리 설치 여부 확인
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        print("필수 라이브러리가 설치되지 않았습니다.")
+        print("pip install python-dotenv")
+        exit()
+    
+    # .env 파일에서 API 키 로드 확인
+    load_dotenv()
+    if not os.getenv("TOUR_API_KTY"):
+        print("TourAPI 키가 설정되지 않았습니다. .env 파일에 TOUR_API_KTY를 추가해주세요.")
+        exit()
+
     demo.launch(debug=True)
