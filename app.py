@@ -1,4 +1,3 @@
-
 import gradio as gr
 import requests
 import requests.adapters
@@ -47,6 +46,65 @@ CONTENT_TYPE_CODES = {
 }
 ROWS_PER_PAGE = 10
 PAGE_WINDOW_SIZE = 5
+
+# --- CSV 및 상세 정보 표시에서 제외할 키 목록 ---
+EXCLUDED_KEYS = {
+    'createdtime', 'modifiedtime', 'cpyrhtDivCd', 'areacode', 'sigungucode',
+    'lDongRegnCd', 'lDongSignguCd', 'lclsSystm1', 'lclsSystm2', 'lclsSystm3',
+    'zipcode', 'mapx', 'mapy', 'mlevel',
+    'agelimit', 'bookingplace', 'placeinfo', 'subevent', 'program',
+    'discountinfofestival', 'spendtimefestival', 'festivalgrade',
+    'progresstype', 'festivaltype', 'serialnum', 'infoname', 'fldgubun'
+}
+
+def is_key_excluded(key):
+    """키가 제외 대상인지 확인합니다."""
+    if key == 'eventenddate':
+        return False
+    if not key: return True
+    return 'id' in key.lower() or key.lower().startswith('cat') or key in EXCLUDED_KEYS
+
+def format_json_to_clean_string(json_data):
+    """JSON 데이터를 필터링하고 사람이 읽기 쉬운 마크다운 문자열로 변환합니다."""
+    if not isinstance(json_data, dict):
+        return str(json_data)
+
+    items = json_data.get('response', {}).get('body', {}).get('items', {}).get('item', [])
+    if not items:
+        return "표시할 정보가 없습니다."
+    
+    if isinstance(items, dict):
+        items = [items]
+
+    output_lines = []
+    for item in items:
+        # 이미지 URL들을 먼저 처리하여 맨 위에 표시
+        image_keys = ['firstimage', 'firstimage2']
+        for key in image_keys:
+            value = item.get(key)
+            if value and 'http' in str(value):
+                output_lines.append(f"![{key}]({value})")
+        
+        # 나머지 텍스트 정보 처리
+        for key, value in item.items():
+            if key in image_keys: continue # 이미 처리했으므로 건너뜀
+
+            if not is_key_excluded(key) and value and str(value).strip():
+                if key == 'homepage':
+                    match = re.search(r'href=["\\](["\\][^"\\]+)["\\]', str(value))
+                    value = match.group(1) if match else clean_html(str(value))
+                
+                cleaned_value = clean_html(str(value))
+                
+                if cleaned_value:
+                    output_lines.append(f"**{key}**: {cleaned_value}")
+        output_lines.append("---")
+    
+    if output_lines:
+        output_lines.pop()
+
+    return "\n\n".join(output_lines) if output_lines else "표시할 정보가 없습니다."
+
 
 # --- 위치 정보를 가져오는 JavaScript ---
 get_location_js = """
@@ -165,7 +223,7 @@ def get_details(selected_title, places_info):
         try:
             params = {**common_params, **specific_params}
             response = session.get(f"{BASE_URL}{api_name}", params=params)
-            response.raise_for_status()  # 4xx, 5xx 에러 발생 시 예외 처리
+            response.raise_for_status()
             
             if not response.text or not response.text.strip():
                 raise ValueError("API 응답이 비어 있습니다.")
@@ -174,9 +232,11 @@ def get_details(selected_title, places_info):
             
             header = response_json.get('response', {}).get('header', {})
             if header.get('resultCode') != '0000':
-                pretty_output = f"API 오류: {header.get('resultMsg', '')}"
-            else:
+                # API 자체 에러 발생 시, 포맷하지 않고 원본 JSON을 보여줌
                 pretty_output = json.dumps(response_json, indent=2, ensure_ascii=False)
+            else:
+                # 성공 시에만 필터링 및 클린 포맷 적용
+                pretty_output = format_json_to_clean_string(response_json)
 
             results[i * 2] = json.dumps(response_json, indent=2, ensure_ascii=False)
             results[i * 2 + 1] = pretty_output
@@ -236,39 +296,34 @@ def export_to_csv(area_name, sigungu_name, category_name, progress=gr.Progress()
             if isinstance(items, dict): items = [items]
             all_basic_items.extend(items)
 
-        # 3. 각 아이템의 상세 정보 조회 및 헤더 순서 결정
+        # 3. 각 아이템의 상세 정보 조회 및 데이터 재구성
         all_item_details = []
         ordered_headers = []
         seen_keys = set()
-        excluded_suffixes = ('id', 'code', 'cd')
 
         def add_key_to_header(key):
-            is_excluded = False
-            for suffix in excluded_suffixes:
-                if key.lower().endswith(suffix):
-                    is_excluded = True
-                    break
-            if not is_excluded and key not in seen_keys:
+            if is_key_excluded(key):
+                return
+            if key not in seen_keys:
                 ordered_headers.append(key)
                 seen_keys.add(key)
 
-        for item in progress.tqdm(all_basic_items, desc="상세 정보 조회 및 컬럼 순서 지정 중"):
+        for item in progress.tqdm(all_basic_items, desc="상세 정보 조회 및 데이터 구성 중"):
             content_id = item.get('contentid')
             content_type_id = item.get('contenttypeid')
-            if not content_id: continue
+            if not content_id:
+                continue
 
-            current_item_data = {}
+            base_data = {}
             try:
-                # 기본 정보 먼저 추가
-                current_item_data.update(item)
+                # 기본 정보와 공통, 소개 정보 수집
+                base_data.update(item)
                 for key in item.keys():
                     add_key_to_header(key)
 
-                # 상세 정보 API들 순차적 호출
                 apis_to_process = [
                     ("detailCommon2", {**common_params, "contentId": content_id, "defaultYN": "Y", "firstImageYN": "Y", "areacodeYN": "Y", "catcodeYN": "Y", "addrinfoYN": "Y", "mapinfoYN": "Y", "overviewYN": "Y"}),
                     ("detailIntro2", {**common_params, "contentId": content_id, "contentTypeId": content_type_id}),
-                    ("detailInfo2", {**common_params, "contentId": content_id, "contentTypeId": content_type_id})
                 ]
 
                 for api_name, params in apis_to_process:
@@ -282,18 +337,31 @@ def export_to_csv(area_name, sigungu_name, category_name, progress=gr.Progress()
                     if isinstance(res_items, dict): res_items = [res_items]
 
                     for res_item in res_items:
-                        if api_name == 'detailInfo2':
-                            infoname = res_item.get('infoname')
-                            infotext = res_item.get('infotext')
-                            if infoname and infotext:
-                                add_key_to_header(infoname)
-                                current_item_data[infoname] = infotext
-                        else:
-                            current_item_data.update(res_item)
-                            for key in res_item.keys():
-                                add_key_to_header(key)
+                        base_data.update(res_item)
+                        for key in res_item.keys():
+                            add_key_to_header(key)
                 
-                all_item_details.append(current_item_data)
+                # 반복 정보(detailInfo2) 처리
+                detail_info_params = {**common_params, "contentId": content_id, "contentTypeId": content_type_id}
+                response = session.get(f"{BASE_URL}detailInfo2", params=detail_info_params)
+                response.raise_for_status()
+                
+                info_items = []
+                if response.text and response.text.strip():
+                    res = response.json()
+                    info_items = res.get('response', {}).get('body', {}).get('items', {}).get('item', [])
+                    if isinstance(info_items, dict): info_items = [info_items]
+
+                if info_items:
+                    for info_item in info_items:
+                        # 각 반복 정보 아이템에 대해 행 추가
+                        row_data = {**base_data, **info_item}
+                        all_item_details.append(row_data)
+                        for key in info_item.keys():
+                            add_key_to_header(key)
+                else:
+                    # 반복 정보가 없으면 기본 정보만으로 행 추가
+                    all_item_details.append(base_data)
 
             except Exception as detail_e:
                 print(f"Error fetching details for content_id {content_id}: {detail_e}")
@@ -310,7 +378,15 @@ def export_to_csv(area_name, sigungu_name, category_name, progress=gr.Progress()
         writer.writeheader()
 
         for item_data in all_item_details:
-            cleaned_item = {k: clean_html(v) if isinstance(v, str) else v for k, v in item_data.items()}
+            cleaned_item = {}
+            for k, v in item_data.items():
+                if k == 'homepage':
+                    # homepage 필드에서 URL 추출
+                    match = re.search(r'href=["\\](["\\][^"\\]+)["\\]', str(v))
+                    cleaned_item[k] = match.group(1) if match else clean_html(str(v))
+                else:
+                    # 다른 필드는 기존 방식대로 HTML 태그 제거
+                    cleaned_item[k] = clean_html(v) if isinstance(v, str) else v
             writer.writerow(cleaned_item)
         
         csv_content = output.getvalue()
@@ -344,9 +420,9 @@ with gr.Blocks(title="TourAPI 관광 정보 앱") as demo:
             search_button_nearby = gr.Button("이 좌표로 주변 관광지 검색", variant="primary")
             radio_list_nearby = gr.Radio(label="관광지 목록", interactive=True)
             with gr.Accordion("상세 정보 보기", open=False):
-                common_raw_n, common_pretty_n = gr.Textbox(label="Raw JSON"), gr.Textbox(label="Formatted")
-                intro_raw_n, intro_pretty_n = gr.Textbox(label="Raw JSON"), gr.Textbox(label="Formatted")
-                info_raw_n, info_pretty_n = gr.Textbox(label="Raw JSON"), gr.Textbox(label="Formatted")
+                common_raw_n, common_pretty_n = gr.Textbox(label="Raw JSON"), gr.Markdown()
+                intro_raw_n, intro_pretty_n = gr.Textbox(label="Raw JSON"), gr.Markdown()
+                info_raw_n, info_pretty_n = gr.Textbox(label="Raw JSON"), gr.Markdown()
             get_loc_button.click(fn=None, js=get_location_js, outputs=[lat_box, lon_box])
             search_button_nearby.click(fn=find_nearby_places, inputs=[lat_box, lon_box], outputs=[radio_list_nearby, places_info_state_nearby])
             radio_list_nearby.change(fn=get_details, inputs=[radio_list_nearby, places_info_state_nearby], outputs=[common_raw_n, common_pretty_n, intro_raw_n, intro_pretty_n, info_raw_n, info_pretty_n])
@@ -382,9 +458,9 @@ with gr.Blocks(title="TourAPI 관광 정보 앱") as demo:
             csv_file_output = gr.File(label="다운로드", interactive=False)
 
             with gr.Accordion("상세 정보 보기", open=False):
-                common_raw_a, common_pretty_a = gr.Textbox(label="Raw JSON"), gr.Textbox(label="Formatted")
-                intro_raw_a, intro_pretty_a = gr.Textbox(label="Raw JSON"), gr.Textbox(label="Formatted")
-                info_raw_a, info_pretty_a = gr.Textbox(label="Raw JSON"), gr.Textbox(label="Formatted")
+                common_raw_a, common_pretty_a = gr.Textbox(label="Raw JSON"), gr.Markdown()
+                intro_raw_a, intro_pretty_a = gr.Textbox(label="Raw JSON"), gr.Markdown()
+                info_raw_a, info_pretty_a = gr.Textbox(label="Raw JSON"), gr.Markdown()
             
             # 이벤트 리스너
             outputs_for_page_change = [current_area, current_sigungu, current_category, current_page, total_pages, places_info_state_area, radio_list_area, page_numbers_radio, first_page_btn, prev_page_btn, next_page_btn, last_page_btn, pagination_row]
