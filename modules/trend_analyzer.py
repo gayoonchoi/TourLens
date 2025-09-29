@@ -5,15 +5,142 @@ import matplotlib.pyplot as plt
 import gradio as gr
 import math
 import traceback
+import io
+from PIL import Image # PIL 임포트 추가
 
-from utils import common_params, session, BASE_URL, get_api_items, is_key_excluded # is_key_excluded 추가
-from modules.naver_review import get_naver_trend
+from utils import common_params, session, BASE_URL, get_api_items, is_key_excluded
+from modules.naver_review import get_naver_trend, search_naver_blog
 from modules.area_search.controls import AREA_CODES, CONTENT_TYPE_CODES
+
+# --- 신규 추가: 단일 아이템 분석 및 결과 반환 함수 ---
+def analyze_single_item(keyword):
+    """단일 키워드에 대해 트렌드 그래프와 블로그 후기를 분석하여 반환합니다."""
+    if not keyword:
+        return None, "분석할 키워드가 없습니다."
+
+    # 1. 트렌드 분석 및 그래프 생성
+    today = datetime.date.today()
+    start_date = today - datetime.timedelta(days=90)
+    trend_data = get_naver_trend(keyword, start_date, today)
+    
+    trend_image = None # 반환할 변수명을 image 객체로 변경
+    if trend_data:
+        try:
+            plt.rcParams['font.family'] = 'Malgun Gothic'
+            plt.rcParams['axes.unicode_minus'] = False
+            df = pd.DataFrame(trend_data)
+            df['period'] = pd.to_datetime(df['period'])
+            df['ratio'] = df['ratio'].astype(float)
+
+            plt.figure(figsize=(10, 5))
+            plt.plot(df['period'], df['ratio'], marker='o', linestyle='-')
+            plt.title(f"'{keyword}' 검색어 트렌드 (최근 90일)")
+            plt.xlabel("날짜")
+            plt.ylabel("상대적 검색량")
+            plt.grid(True)
+            plt.tight_layout()
+
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png')
+            plt.close()
+            buf.seek(0)
+            trend_image = Image.open(buf) # Base64 대신 PIL Image 객체로 변환
+        except Exception as e:
+            print(f"트렌드 그래프 생성 중 오류: {e}")
+            plt.close()
+
+    # 2. 블로그 후기 검색
+    blog_posts = search_naver_blog(keyword, display=3)
+    reviews_markdown = "### 네이버 블로그 후기\n---"
+    if blog_posts:
+        for post in blog_posts:
+            reviews_markdown += f"#### [{post['title']}]({post['link']})\n"
+            reviews_markdown += f"> {post['description']}\n\n"
+    else:
+        reviews_markdown += "\n관련 블로그 후기를 찾을 수 없습니다.\n"
+
+    return trend_image, reviews_markdown
+
+
+# --- 범용 트렌드/후기 분석 함수 (파일 저장용) ---
+def analyze_trends_for_titles(titles, progress=gr.Progress()):
+    """주어진 제목 리스트에 대해 네이버 트렌드 및 블로그 후기 분석을 수행하고 결과를 저장합니다."""
+    if not titles:
+        return "분석할 관광지 이름이 없습니다."
+
+    try:
+        plt.rcParams['font.family'] = 'Malgun Gothic'
+        plt.rcParams['axes.unicode_minus'] = False
+    except Exception as e:
+        print(f"폰트 설정 오류: {e}. 그래프의 한글이 깨질 수 있습니다.")
+
+    trend_results = []
+    review_results = [] # 후기 결과를 저장할 리스트
+    today = datetime.date.today()
+    trend_output_dir = r"C:\Users\SBA\github\TourLens\naver_trend"
+    os.makedirs(trend_output_dir, exist_ok=True)
+
+    for keyword in progress.tqdm(titles, total=len(titles), desc="관광지별 트렌드 및 후기 분석 중"):
+        keyword = str(keyword).strip()
+        if not keyword:
+            continue
+
+        # 1. 트렌드 분석
+        start_date = today - datetime.timedelta(days=90)
+        df_trend_data = get_naver_trend(keyword, start_date, today)
+
+        if df_trend_data:
+            df_trend = pd.DataFrame(df_trend_data)
+            try:
+                plt.figure(figsize=(10, 5))
+                plt.plot(pd.to_datetime(df_trend['period']), df_trend['ratio'].astype(float), marker='o')
+                plt.title(f"{keyword} 검색어 트렌드")
+                plt.xlabel("날짜")
+                plt.ylabel("검색량 지수")
+                plt.grid(True)
+                safe_keyword = "".join(c for c in keyword if c.isalnum() or c in (' ', '-')).rstrip()
+                save_path = os.path.join(trend_output_dir, f"{safe_keyword}_trend.png")
+                plt.savefig(save_path, dpi=150, bbox_inches="tight")
+                plt.close()
+            except Exception as e:
+                print(f"'{keyword}' 그래프 저장 중 오류: {e}")
+                plt.close()
+
+            df_trend['keyword'] = keyword
+            trend_results.append(df_trend)
+        else:
+            print(f"⚠️ '{keyword}'에 대한 트렌드 검색 결과가 없어 그래프를 생성하지 않습니다.")
+
+        # 2. 블로그 후기 검색
+        blog_posts = search_naver_blog(keyword, display=5)
+        if blog_posts:
+            for post in blog_posts:
+                post['keyword'] = keyword # 어떤 키워드로 검색되었는지 추가
+                review_results.append(post)
+
+    # 3. 결과 저장
+    output_messages = []
+    if trend_results:
+        final_trend_df = pd.concat(trend_results, ignore_index=True)
+        final_trend_csv_path = os.path.join(trend_output_dir, "Seoul_Attractions_Trend.csv")
+        final_trend_df.to_csv(final_trend_csv_path, index=False, encoding="utf-8-sig")
+        output_messages.append(f"{len(trend_results)}개 항목의 트렌드 분석")
+    
+    if review_results:
+        final_review_df = pd.DataFrame(review_results)
+        final_review_csv_path = os.path.join(trend_output_dir, "Seoul_Attractions_Reviews.csv")
+        final_review_df.to_csv(final_review_csv_path, index=False, encoding="utf-8-sig")
+        output_messages.append(f"{len(review_results)}개 후기 수집")
+
+    if not output_messages:
+        return "트렌드 및 후기 분석을 수행할 항목이 없습니다."
+    else:
+        return f"분석 완료! {' / '.join(output_messages)}. 결과는 \"{trend_output_dir}\" 폴더에 저장되었습니다."
+
 
 # --- 내부 헬퍼 함수: 파일 기반 트렌드 분석 실행 ---
 def _run_analysis_from_file(tour_api_path, trend_output_dir, progress_tracker):
     try:
-        # 한글 폰트 설정
         plt.rcParams['font.family'] = 'Malgun Gothic'
         plt.rcParams['axes.unicode_minus'] = False
     except Exception as e:
