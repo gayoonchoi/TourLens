@@ -7,7 +7,7 @@ import math
 import traceback
 
 from utils import common_params, session, BASE_URL, get_api_items, is_key_excluded # is_key_excluded 추가
-from naver_api import get_naver_trend
+from modules.naver_review import get_naver_trend
 from modules.area_search.controls import AREA_CODES, CONTENT_TYPE_CODES
 
 # --- 내부 헬퍼 함수: 파일 기반 트렌드 분석 실행 ---
